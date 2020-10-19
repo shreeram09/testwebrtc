@@ -1,0 +1,317 @@
+var username = prompt('Enter username:');
+var connection;
+var clientId;
+var candidates = [];//{id:SocketConnectionID,peer:RTCPeerConnection},..
+const offerOptions = {
+  offerToReceiveAudio: 0,
+  offerToReceiveVideo: 1
+};
+// function connect() {
+connection = new WebSocket("ws://localhost:6505", "json");
+
+connection.onopen = function (evt) { };
+connection.onerror = function (evt) {
+  console.dir(evt);
+};
+connection.onmessage = function (evt) {
+  var msg = JSON.parse(evt.data);
+  console.log('client==>', msg);
+  switch (msg.type) {
+    case 'id':
+      clientId = msg.id;
+      setData('proctor');
+      break;
+    case 'data':
+      document.getElementById('details').innerText = JSON.stringify(msg);
+      break;
+    case 'new-candidate':
+      candidates.push({
+        name: msg.name,
+        id: msg.id,
+        meetingId: msg.meetingId,
+        userType: msg.userType
+      });
+      addCandidateStream(msg);
+      break;
+    // Signaling messages: these messages are used to trade WebRTC
+    // signaling information during negotiations leading up to a video
+    // call.
+
+    case "video-offer":  // Invitation and offer to chat
+      handleVideoOfferMsg(msg);
+      break;
+    case "video-answer":  // Callee has answered our offer
+      handleVideoAnswerMsg(msg);
+      break;
+    case "new-ice-candidate": // A new ICE candidate has been received
+      handleNewICECandidateMsg(msg);
+      break;
+    default:
+      console.log('unknown message :', msg);
+  }
+};
+// }
+
+function setData(usertype) {
+  sendToServer({
+    name: username,
+    date: Date.now(),
+    id: clientId,
+    userType: usertype,
+    type: "username"
+  });
+}
+
+function sendToServer(msg) {
+  var msgJSON = JSON.stringify(msg);
+
+  console.log("Sending '" + msg.type + "' message: " + msgJSON);
+  connection.send(msgJSON);
+}
+
+function addCandidateStream(msg) {
+  var candidate = candidates.filter(c => c.id === msg.id);
+  var video = document.createElement('video');
+  video.id = '' + msg.id; video.muted = true; video.autoplay = true; video.controls = true;
+  document.getElementById('candidates').prepend(video);
+  candidate[0].myPeer = createPeerConnection(candidate[0]);
+}
+
+function createPeerConnection(remoteClient) {
+  console.log("Setting up a connection...");
+
+  // Create an RTCPeerConnection which knows to use our chosen
+  // STUN server.
+  var servers = {
+    iceServers: [     // Information about ICE servers - Use your own!
+      {
+        urls: "turn:" + 'localhost',  // A TURN server
+        username: "webrtc",
+        credential: "turnserver"
+      }
+    ]
+  };
+  var myPeerConnection = new RTCPeerConnection();
+
+  // Set up event handlers for the ICE negotiation process.
+
+  myPeerConnection.onicecandidate = function (event) {
+    if (event.candidate) {
+      console.log("*** Outgoing ICE candidate: " + event.candidate.candidate);
+
+      sendToServer({
+        type: "new-ice-candidate",
+        from: username,
+        actor: 'candidate',
+        target: remoteClient.id,
+        candidate: event.candidate
+      });
+    }
+  };
+  myPeerConnection.oniceconnectionstatechange = function (event) {
+    console.log("*** ICE connection state changed to " + myPeerConnection.iceConnectionState);
+
+    switch (myPeerConnection.iceConnectionState) {
+      case "closed":
+      case "failed":
+      case "disconnected":
+        closeVideoCall(remoteClient.id);
+        break;
+    }
+  };
+  myPeerConnection.onicegatheringstatechange = function (event) {
+    console.log("*** ICE gathering state changed to: " + myPeerConnection.iceGatheringState);
+  };
+  myPeerConnection.onsignalingstatechange = function (event) {
+    console.log("*** WebRTC signaling state changed to: " + myPeerConnection.signalingState);
+    switch (myPeerConnection.signalingState) {
+      case "closed":
+        closeVideoCall(remoteClient.id);
+        break;
+    }
+  };
+  myPeerConnection.onnegotiationneeded = async function () {
+    console.log("*** Negotiation needed");
+
+    try {
+      console.log("---> Creating offer");
+      const offer = await myPeerConnection.createOffer();
+
+      // If the connection hasn't yet achieved the "stable" state,
+      // return to the caller. Another negotiationneeded event
+      // will be fired when the state stabilizes.
+
+      if (myPeerConnection.signalingState != "stable") {
+        console.log("     -- The connection isn't stable yet; postponing...")
+        return;
+      }
+
+      // Establish the offer as the local peer's current
+      // description.
+
+      console.log("---> Setting local description to the offer");
+      await myPeerConnection.setLocalDescription(offer);
+
+      // Send the offer to the remote peer.
+
+      console.log("---> Sending the offer to the remote peer");
+      sendToServer({
+        name: username,
+        actor: 'candidate',
+        target: remoteClient.id,
+        type: "video-offer",
+        sdp: myPeerConnection.localDescription
+      });
+    } catch (err) {
+      console.log("*** The following error occurred while handling the negotiationneeded event:", err.name, err.message);
+      //   reportError(err);
+    };
+  };
+  myPeerConnection.ontrack = function (event) {
+    console.log("*** Track event", event.streams);
+    var videotag = document.getElementById('' + remoteClient.id);
+    // if (videotag.srcObject) return;
+    videotag.srcObject = event.streams[0];
+    videotag.autoplay = true;
+    videotag.controls = true;
+    // document.getElementById("hangup-button").disabled = false;
+  };
+  return myPeerConnection;
+}
+
+async function handleVideoOfferMsg(msg) {
+  // targetUsername = msg.name;
+  var candidate = candidates.filter(c => c.id === msg.from)[0];
+  // If we're not already connected, create an RTCPeerConnection
+  // to be linked to the caller.
+
+  console.log("Received video chat offer from ", candidate);
+  if (!candidate.myPeer) {
+    candidate.myPeer = createPeerConnection(candidate.clientId);
+  }
+
+  // We need to set the remote description to the received SDP offer
+  // so that our local WebRTC layer knows how to talk to the caller.
+
+  var desc = new RTCSessionDescription(msg.sdp);
+
+  // If the connection isn't stable yet, wait for it...
+  console.log(candidate.myPeer.signalingState);
+  if (candidate.myPeer.signalingState != "stable") {
+    console.log("  - But the signaling state isn't stable, so triggering rollback");
+
+    // Set the local and remove descriptions for rollback; don't proceed
+    // until both return.
+    await Promise.all([
+      candidate.myPeer.setLocalDescription({ type: "rollback" }),
+      candidate.myPeer.setRemoteDescription(desc)
+    ]);
+    return;
+  } else {
+    console.log("  - Setting remote description");
+    await candidate.myPeer.setRemoteDescription(desc);
+  }
+
+  // Get the webcam stream if we don't already have it
+
+  // if (!webcamStream) {
+  //   try {
+  //     webcamStream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
+  //   } catch(err) {
+  //     handleGetUserMediaError(err);
+  //     return;
+  //   }
+
+  //   document.getElementById("local_video").srcObject = webcamStream;
+
+  // Add the camera stream to the RTCPeerConnection
+
+  // try {
+  //   webcamStream.getTracks().forEach(
+  //     transceiver = track => myPeerConnection.addTransceiver(track, {streams: [webcamStream]})
+  //   );
+  // } catch(err) {
+  //   handleGetUserMediaError(err);
+  // }
+  // }
+
+  console.log("---> Creating and sending answer to caller");
+
+  await candidate.myPeer.setLocalDescription(await candidate.myPeer.createAnswer());
+
+  sendToServer({
+    name: username,
+    actor: 'candidate',
+    target: candidate.id,
+    type: "video-answer",
+    sdp: candidate.myPeer.localDescription
+  });
+}
+
+async function handleVideoAnswerMsg(msg) {
+  console.log("*** Call recipient has accepted our call");
+  var candidate = candidates.filter(c => c.id === msg.target)[0];
+  // Configure the remote description, which is the SDP payload
+  // in our "video-answer" message.
+
+  var desc = new RTCSessionDescription(msg.sdp);
+  await candidate.myPeer.setRemoteDescription(desc).catch(function (err) { console.log(err.name, err.message); });
+}
+
+async function handleNewICECandidateMsg(msg) {
+  var candidate = candidates.filter(c => c.id === msg.from)[0];
+  var ice = new RTCIceCandidate(msg.candidate);
+
+  console.log("*** Adding received ICE candidate: " + JSON.stringify(ice));
+  try {
+    await candidate.myPeer.addIceCandidate(ice)
+  } catch (err) {
+    console.log(err.name, err.message);
+  }
+}
+
+function closeVideoCall(candidateId) {
+  // var localVideo = document.getElementById("local_video");
+  var candidate = candidates.filter(c => c.id === candidateId)[0];
+  console.log("Closing the call");
+
+  // Close the RTCPeerConnection
+
+  if (candidate.myPeer) {
+    console.log("--> Closing the peer connection");
+
+    // Disconnect all our event listeners; we don't want stray events
+    // to interfere with the hangup while it's ongoing.
+
+    candidate.myPeer.ontrack = null;
+    candidate.myPeer.onnicecandidate = null;
+    candidate.myPeer.oniceconnectionstatechange = null;
+    candidate.myPeer.onsignalingstatechange = null;
+    candidate.myPeer.onicegatheringstatechange = null;
+    candidate.myPeer.onnotificationneeded = null;
+
+    // Stop all transceivers on the connection
+
+    // if(candidate.myPeer.getTransceivers())
+    //   candidate.myPeer.getTransceivers().forEach(transceiver => {
+    //     transceiver.stop();
+    //   });
+
+    // Stop the webcam preview as well by pausing the <video>
+    // element, then stopping each of the getUserMedia() tracks
+    // on it.
+
+    // if (webcamStream) {
+    //   // localVideo.pause();
+    //   webcamStream.getTracks().forEach(track => {
+    //     track.stop();
+    //   });
+    // }
+
+    // Close the peer connection
+
+    candidate.myPeer.close();
+    candidate.myPeer = null;
+    // webcamStream = null;
+  }
+}
