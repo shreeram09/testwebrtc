@@ -5,8 +5,9 @@ websocket server will require ssl key and certificate file
 which can be generated from openSSL utility
 
 # install openSSL utitlity 
-  ### in case of linux you can download & install from https://www.openssl.org/source/ 
-    or 
+  ### in case of linux you can download & install 
+  from https://www.openssl.org/source/ 
+  OR
   from terminal
   $ sudo apt-get install openssl openssl-devel
 
